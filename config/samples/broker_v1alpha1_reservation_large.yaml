@@ -1,0 +1,12 @@
+apiVersion: broker.fluidos.eu/v1alpha1
+kind: Reservation
+metadata:
+  name: reservation-large
+  namespace: default
+spec:
+  requestedResources:
+    cpu: "8"
+    memory: "15Gi"
+  priority: 20
+  requesterID: "user-456"
+  duration: "2h"
