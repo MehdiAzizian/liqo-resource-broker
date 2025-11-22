@@ -58,6 +58,27 @@ func (r *ClusterAdvertisementReconciler) Reconcile(ctx context.Context, req ctrl
 		return ctrl.Result{}, err
 	}
 
+	// Recalculate Available based on Allocatable - Allocated - Reserved
+	available := clusterAdv.Spec.Resources.Allocatable.CPU.DeepCopy()
+	available.Sub(clusterAdv.Spec.Resources.Allocated.CPU)
+	if clusterAdv.Spec.Resources.Reserved != nil {
+		available.Sub(clusterAdv.Spec.Resources.Reserved.CPU)
+	}
+	clusterAdv.Spec.Resources.Available.CPU = available
+
+	availableMem := clusterAdv.Spec.Resources.Allocatable.Memory.DeepCopy()
+	availableMem.Sub(clusterAdv.Spec.Resources.Allocated.Memory)
+	if clusterAdv.Spec.Resources.Reserved != nil {
+		availableMem.Sub(clusterAdv.Spec.Resources.Reserved.Memory)
+	}
+	clusterAdv.Spec.Resources.Available.Memory = availableMem
+
+	// Update the spec with recalculated available
+	if err := r.Update(ctx, clusterAdv); err != nil {
+		logger.Error(err, "Failed to update available resources")
+		// Continue anyway to update status
+	}
+
 	// Check if advertisement is stale (older than 2 minutes)
 	age := time.Since(clusterAdv.Spec.Timestamp.Time)
 	isStale := age > 10*time.Minute

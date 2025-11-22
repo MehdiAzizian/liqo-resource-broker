@@ -56,6 +56,10 @@ type ResourceMetrics struct {
 	// Allocated - Sum of resources requested by all pods
 	Allocated ResourceQuantities `json:"allocated"`
 
+	// Reserved - Resources locked by reservations (NEW!)
+	// +optional
+	Reserved *ResourceQuantities `json:"reserved,omitempty"`
+
 	// Available - Allocatable minus Allocated (what's still schedulable)
 	Available ResourceQuantities `json:"available"`
 }

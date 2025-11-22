@@ -281,6 +281,11 @@ func (in *ResourceMetrics) DeepCopyInto(out *ResourceMetrics) {
 	in.Capacity.DeepCopyInto(&out.Capacity)
 	in.Allocatable.DeepCopyInto(&out.Allocatable)
 	in.Allocated.DeepCopyInto(&out.Allocated)
+	if in.Reserved != nil {
+		in, out := &in.Reserved, &out.Reserved
+		*out = new(ResourceQuantities)
+		(*in).DeepCopyInto(*out)
+	}
 	in.Available.DeepCopyInto(&out.Available)
 }
 

@@ -22,14 +22,16 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	brokerv1alpha1 "github.com/mehdiazizian/liqo-resource-broker/api/v1alpha1"
 	"github.com/mehdiazizian/liqo-resource-broker/internal/broker"
+	"github.com/mehdiazizian/liqo-resource-broker/internal/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // ReservationReconciler reconciles a Reservation object
@@ -59,6 +61,32 @@ func (r *ReservationReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 		logger.Error(err, "Failed to get Reservation")
 		return ctrl.Result{}, err
+	}
+
+	// Handle deletion with finalizer
+	if reservation.ObjectMeta.DeletionTimestamp != nil {
+		if controllerutil.ContainsFinalizer(reservation, brokerv1alpha1.ReservationFinalizer) {
+			// Release resources before deletion
+			if err := r.releaseResources(ctx, reservation, logger); err != nil {
+				logger.Error(err, "Failed to release resources")
+				return ctrl.Result{}, err
+			}
+
+			// Remove finalizer
+			controllerutil.RemoveFinalizer(reservation, brokerv1alpha1.ReservationFinalizer)
+			if err := r.Update(ctx, reservation); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Add finalizer if not present
+	if !controllerutil.ContainsFinalizer(reservation, brokerv1alpha1.ReservationFinalizer) {
+		controllerutil.AddFinalizer(reservation, brokerv1alpha1.ReservationFinalizer)
+		if err := r.Update(ctx, reservation); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Handle different phases
@@ -131,7 +159,7 @@ func (r *ReservationReconciler) reserveInTargetCluster(
 	logger logr.Logger,
 ) (ctrl.Result, error) {
 
-	// Verify target cluster exists and has resources
+	// Find target cluster
 	clusterAdv := &brokerv1alpha1.ClusterAdvertisement{}
 	clusterList := &brokerv1alpha1.ClusterAdvertisementList{}
 
@@ -140,9 +168,9 @@ func (r *ReservationReconciler) reserveInTargetCluster(
 	}
 
 	found := false
-	for _, cluster := range clusterList.Items {
-		if cluster.Spec.ClusterID == reservation.Spec.TargetClusterID {
-			clusterAdv = &cluster
+	for i := range clusterList.Items {
+		if clusterList.Items[i].Spec.ClusterID == reservation.Spec.TargetClusterID {
+			clusterAdv = &clusterList.Items[i]
 			found = true
 			break
 		}
@@ -159,13 +187,12 @@ func (r *ReservationReconciler) reserveInTargetCluster(
 		return ctrl.Result{}, nil
 	}
 
-	// Check if cluster has enough resources
-	availableCPU := clusterAdv.Spec.Resources.Available.CPU
-	availableMemory := clusterAdv.Spec.Resources.Available.Memory
-	requestedCPU := reservation.Spec.RequestedResources.CPU
-	requestedMemory := reservation.Spec.RequestedResources.Memory
-
-	if availableCPU.Cmp(requestedCPU) < 0 || availableMemory.Cmp(requestedMemory) < 0 {
+	// Check if cluster has enough available resources (using resource calculator)
+	if !resource.CanReserve(
+		clusterAdv,
+		reservation.Spec.RequestedResources.CPU,
+		reservation.Spec.RequestedResources.Memory,
+	) {
 		reservation.Status.Phase = brokerv1alpha1.ReservationPhaseFailed
 		reservation.Status.Message = "Insufficient resources in target cluster"
 		reservation.Status.LastUpdateTime = metav1.Now()
@@ -176,10 +203,48 @@ func (r *ReservationReconciler) reserveInTargetCluster(
 		return ctrl.Result{}, nil
 	}
 
-	// Mark as reserved (in production, this would communicate with the actual cluster)
+	// LOCK RESOURCES: Add to reserved
+	err := resource.AddReservation(
+		clusterAdv,
+		reservation.Spec.RequestedResources.CPU,
+		reservation.Spec.RequestedResources.Memory,
+	)
+	if err != nil {
+		logger.Error(err, "Failed to add reservation to cluster")
+		reservation.Status.Phase = brokerv1alpha1.ReservationPhaseFailed
+		reservation.Status.Message = fmt.Sprintf("Failed to lock resources: %v", err)
+		reservation.Status.LastUpdateTime = metav1.Now()
+
+		if err := r.Status().Update(ctx, reservation); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Update the cluster advertisement with new reserved resources
+	if err := r.Update(ctx, clusterAdv); err != nil {
+		logger.Error(err, "Failed to update cluster advertisement")
+		// Try to rollback the reservation
+		_ = resource.RemoveReservation(
+			clusterAdv,
+			reservation.Spec.RequestedResources.CPU,
+			reservation.Spec.RequestedResources.Memory,
+		)
+
+		reservation.Status.Phase = brokerv1alpha1.ReservationPhaseFailed
+		reservation.Status.Message = "Failed to lock resources in cluster"
+		reservation.Status.LastUpdateTime = metav1.Now()
+
+		if err := r.Status().Update(ctx, reservation); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Mark as reserved
 	now := metav1.Now()
 	reservation.Status.Phase = brokerv1alpha1.ReservationPhaseReserved
-	reservation.Status.Message = fmt.Sprintf("Resources reserved in cluster %s", reservation.Spec.TargetClusterID)
+	reservation.Status.Message = fmt.Sprintf("Resources locked in cluster %s", reservation.Spec.TargetClusterID)
 	reservation.Status.ReservedAt = &now
 
 	// Set expiration if duration is specified
@@ -194,12 +259,13 @@ func (r *ReservationReconciler) reserveInTargetCluster(
 		return ctrl.Result{}, err
 	}
 
-	logger.Info("Reservation created successfully",
+	logger.Info("Resources successfully locked",
 		"targetCluster", reservation.Spec.TargetClusterID,
-		"cpu", requestedCPU.String(),
-		"memory", requestedMemory.String())
+		"cpu", reservation.Spec.RequestedResources.CPU.String(),
+		"memory", reservation.Spec.RequestedResources.Memory.String(),
+		"availableAfter", clusterAdv.Spec.Resources.Available.CPU.String())
 
-	return ctrl.Result{RequeueAfter: 2 * time.Minute}, nil
+	return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
 }
 
 // handleReservedReservation manages a reserved reservation
@@ -211,8 +277,16 @@ func (r *ReservationReconciler) handleReservedReservation(
 
 	// Check if expired
 	if reservation.Status.ExpiresAt != nil && time.Now().After(reservation.Status.ExpiresAt.Time) {
+		logger.Info("Reservation expired, releasing resources")
+
+		// Release resources
+		if err := r.releaseResources(ctx, reservation, logger); err != nil {
+			logger.Error(err, "Failed to release resources on expiration")
+			return ctrl.Result{}, err
+		}
+
 		reservation.Status.Phase = brokerv1alpha1.ReservationPhaseReleased
-		reservation.Status.Message = "Reservation expired"
+		reservation.Status.Message = "Reservation expired and resources released"
 		reservation.Status.LastUpdateTime = metav1.Now()
 
 		if err := r.Status().Update(ctx, reservation); err != nil {
@@ -221,9 +295,8 @@ func (r *ReservationReconciler) handleReservedReservation(
 		return ctrl.Result{}, nil
 	}
 
-	// In production, you might transition to Active when resources are actually being used
-	// For now, we keep it in Reserved state
-	return ctrl.Result{RequeueAfter: 2 * time.Minute}, nil
+	// Still valid, check again in 1 minute
+	return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
 }
 
 // handleActiveReservation manages an active reservation
@@ -235,6 +308,14 @@ func (r *ReservationReconciler) handleActiveReservation(
 
 	// Check if expired
 	if reservation.Status.ExpiresAt != nil && time.Now().After(reservation.Status.ExpiresAt.Time) {
+		logger.Info("Active reservation expired, releasing resources")
+
+		// Release resources
+		if err := r.releaseResources(ctx, reservation, logger); err != nil {
+			logger.Error(err, "Failed to release resources on expiration")
+			return ctrl.Result{}, err
+		}
+
 		reservation.Status.Phase = brokerv1alpha1.ReservationPhaseReleased
 		reservation.Status.Message = "Reservation expired and released"
 		reservation.Status.LastUpdateTime = metav1.Now()
@@ -245,7 +326,61 @@ func (r *ReservationReconciler) handleActiveReservation(
 		return ctrl.Result{}, nil
 	}
 
-	return ctrl.Result{RequeueAfter: 2 * time.Minute}, nil
+	return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
+}
+
+// releaseResources releases reserved resources when reservation is deleted
+func (r *ReservationReconciler) releaseResources(
+	ctx context.Context,
+	reservation *brokerv1alpha1.Reservation,
+	logger logr.Logger,
+) error {
+	// Only release if reservation was actually reserved
+	if reservation.Status.Phase != brokerv1alpha1.ReservationPhaseReserved &&
+		reservation.Status.Phase != brokerv1alpha1.ReservationPhaseActive {
+		return nil
+	}
+
+	// Find the cluster advertisement
+	clusterList := &brokerv1alpha1.ClusterAdvertisementList{}
+	if err := r.List(ctx, clusterList); err != nil {
+		return err
+	}
+
+	var targetCluster *brokerv1alpha1.ClusterAdvertisement
+	for i := range clusterList.Items {
+		if clusterList.Items[i].Spec.ClusterID == reservation.Spec.TargetClusterID {
+			targetCluster = &clusterList.Items[i]
+			break
+		}
+	}
+
+	if targetCluster == nil {
+		logger.Info("Target cluster not found, skipping resource release")
+		return nil
+	}
+
+	// Release the resources
+	err := resource.RemoveReservation(
+		targetCluster,
+		reservation.Spec.RequestedResources.CPU,
+		reservation.Spec.RequestedResources.Memory,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to remove reservation: %w", err)
+	}
+
+	// Update the cluster advertisement
+	if err := r.Update(ctx, targetCluster); err != nil {
+		return fmt.Errorf("failed to update cluster after releasing resources: %w", err)
+	}
+
+	logger.Info("Successfully released resources",
+		"cluster", reservation.Spec.TargetClusterID,
+		"cpu", reservation.Spec.RequestedResources.CPU.String(),
+		"memory", reservation.Spec.RequestedResources.Memory.String())
+
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

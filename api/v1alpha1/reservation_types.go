@@ -21,6 +21,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// ReservationFinalizer is the finalizer for reservations
+const ReservationFinalizer = "reservation.broker.fluidos.eu/finalizer"
+
 // ReservationSpec defines the desired state of Reservation
 type ReservationSpec struct {
 	// TargetClusterID is the cluster where resources should be reserved
