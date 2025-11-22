@@ -1,138 +1,203 @@
-# Liqo Resource Broker (liqo-rb)
+# Kubernetes Resource Broker
 
-Central broker that aggregates resource advertisements from multiple Kubernetes clusters and makes intelligent decisions about resource allocation.
+A Kubernetes operator that aggregates resource advertisements from multiple clusters and intelligently allocates resources through reservations.
+
+**Master's Thesis Project** - Multi-Cluster Resource Management System
+
+---
+
+## Overview
+
+The Resource Broker receives resource advertisements from multiple Kubernetes clusters (via Resource Agents) and makes intelligent decisions about where to allocate workloads based on resource availability, cost, and scoring algorithms.
+
+### Key Features
+
+✅ **Multi-Cluster Aggregation**
+- Receives advertisements from multiple clusters
+- Tracks resource availability in real-time
+- Automatic staleness detection (10-minute threshold)
+
+✅ **Intelligent Decision Engine**
+- Scoring algorithm (0-100) based on resource availability
+- Automatic cluster selection for reservations
+- Considers CPU, Memory, and cost metrics
+
+✅ **Resource Locking & Concurrency Control**
+- Prevents resource overbooking
+- Transaction-safe reservation process
+- Automatic resource release on expiration
+- Finalizer-based cleanup
+
+✅ **Reservation Lifecycle**
+- States: Pending → Reserved → Active → Released/Failed
+- Configurable duration with auto-expiration
+- Manual deletion with proper cleanup
+
+---
+
+## Architecture
+```
+┌──────────────┐         ┌──────────────┐
+│  Cluster A   │         │  Cluster B   │
+│              │         │              │
+│ Resource     │         │ Resource     │
+│ Agent        │         │ Agent        │
+└──────┬───────┘         └──────┬───────┘
+       │                        │
+       │ Advertisement          │ Advertisement
+       │ (HTTPS)                │ (HTTPS)
+       ▼                        ▼
+    ┌─────────────────────────────┐
+    │    Resource Broker          │
+    │                             │
+    │  ┌─────────────────────┐   │
+    │  │ ClusterAdvertisement│   │
+    │  │ Controller          │   │
+    │  └──────────┬──────────┘   │
+    │             │               │
+    │  ┌──────────▼──────────┐   │
+    │  │ Decision Engine     │   │
+    │  │ (Scoring)           │   │
+    │  └──────────┬──────────┘   │
+    │             │               │
+    │  ┌──────────▼──────────┐   │
+    │  │ Reservation         │   │
+    │  │ Controller          │   │
+    │  └─────────────────────┘   │
+    └─────────────────────────────┘
+               ▲
+               │ User Request
+               │
+         ┌─────┴─────┐
+         │   User    │
+         └───────────┘
+```
+
+---
 
 ## Quick Start
 
 ### Prerequisites
-- Go 1.25+
-- kubectl
-- kind (for local testing)
+- Go 1.23+
+- Kubernetes cluster (tested with kind)
+- kubectl configured
 
 ### Installation
-
-1. **Navigate to project:**
 ```bash
-   cd ~/liqo-resource-broker
+# Install CRDs
+make install
+
+# Run locally
+make run
 ```
 
-2. **Install CRDs:**
+### Create a Reservation
 ```bash
-   make install
+# Apply sample reservation
+kubectl apply -f config/samples/broker_v1alpha1_reservation.yaml
+
+# View reservations
+kubectl get reservations
+kubectl describe reservation <name>
 ```
 
-3. **Run broker locally:**
+### View Cluster Advertisements
 ```bash
-   make run
+kubectl get clusteradvertisements
+kubectl describe clusteradvertisement <name>
 ```
 
-4. **Create sample cluster advertisements:**
-```bash
-   kubectl apply -f config/samples/broker_v1alpha1_clusteradvertisement.yaml
-   kubectl apply -f config/samples/broker_v1alpha1_clusteradvertisement_2.yaml
-```
+---
 
-5. **Create a reservation:**
-```bash
-   kubectl apply -f config/samples/broker_v1alpha1_reservation.yaml
-```
-
-6. **View results:**
-```bash
-   kubectl get clusteradvertisements
-   kubectl get reservations
-```
-
-## What It Does
-
-The Resource Broker:
-
-- **Aggregates** resource advertisements from multiple clusters
-- **Scores** each cluster based on availability (0-100)
-- **Selects** the best cluster for reservation requests
-- **Tracks** reservation lifecycle (Pending → Reserved → Active → Released)
-- **Monitors** cluster health (marks stale clusters as inactive)
-
-## Architecture
-```
-┌─────────────────────────────────────────────┐
-│         Resource Broker (Central)           │
-│                                             │
-│  ┌───────────────────────────────────┐    │
-│  │   ClusterAdvertisements           │    │
-│  │   - Cluster 1: 10 CPU, 20Gi      │    │
-│  │   - Cluster 2: 5 CPU, 10Gi       │    │
-│  │   - Cluster 3: 8 CPU, 16Gi       │    │
-│  └───────────────┬───────────────────┘    │
-│                  ↓                         │
-│  ┌───────────────────────────────────┐    │
-│  │     Decision Engine               │    │
-│  │     (Score & Select Best)         │    │
-│  └───────────────┬───────────────────┘    │
-│                  ↓                         │
-│  ┌───────────────────────────────────┐    │
-│  │     Reservation Management        │    │
-│  │     - Create                      │    │
-│  │     - Track Lifecycle             │    │
-│  │     - Handle Expiration           │    │
-│  └───────────────────────────────────┘    │
-└─────────────────────────────────────────────┘
-```
-
-## Custom Resources
+## Example Resources
 
 ### ClusterAdvertisement
-Represents resources available in a remote cluster:
 ```yaml
 apiVersion: broker.fluidos.eu/v1alpha1
 kind: ClusterAdvertisement
 metadata:
-  name: cluster-1-adv
+  name: local-cluster-adv
 spec:
-  clusterID: "cluster-1-abc123"
+  clusterID: "fd32c7d2-7cc6-46e6-80aa-d3d5c835586c"
+  clusterName: "local-cluster"
   resources:
-    capacity: {cpu: "16", memory: "32Gi"}
-    allocatable: {cpu: "15", memory: "30Gi"}
-    allocated: {cpu: "5", memory: "10Gi"}
-    available: {cpu: "10", memory: "20Gi"}
-  timestamp: "2025-11-19T16:00:00Z"
+    capacity:
+      cpu: "10"
+      memory: "8025424Ki"
+    allocated:
+      cpu: "1050m"
+      memory: "418Mi"
+    reserved:
+      cpu: "3000m"
+      memory: "4Gi"
+    available:
+      cpu: "5950m"
+      memory: "3597392Ki"
 status:
   active: true
-  score: "66.67"
+  score: "61.25"
+  phase: "Active"
 ```
 
 ### Reservation
-Requests resources from the broker:
 ```yaml
 apiVersion: broker.fluidos.eu/v1alpha1
 kind: Reservation
 metadata:
-  name: my-reservation
+  name: my-workload
 spec:
   requestedResources:
     cpu: "2"
     memory: "4Gi"
   duration: "1h"
+  priority: 10
+  requesterID: "user-team"
 status:
   phase: "Reserved"
-  targetClusterID: "cluster-1-abc123"
+  targetClusterID: "fd32c7d2-7cc6-46e6-80aa-d3d5c835586c"
+  reservedAt: "2025-11-22T15:00:00Z"
+  expiresAt: "2025-11-22T16:00:00Z"
 ```
 
-## Decision Algorithm
+---
 
-**Score Calculation:**
+## Scoring Algorithm
+
+The broker calculates a score (0-100) for each cluster:
 ```
 Score = (Available_CPU / Allocatable_CPU × 50) + 
         (Available_Memory / Allocatable_Memory × 50)
 ```
 
-Higher score = more available resources = better choice
+**Higher score = More available resources**
 
-**Selection:**
-1. Filter inactive clusters (stale >10 min)
-2. Filter clusters without enough resources
-3. Calculate score for remaining clusters
-4. Select highest scoring cluster
+Example:
+- 90-100: Excellent (most resources available)
+- 70-89: Good
+- 50-69: Moderate
+- 0-49: Limited
+
+---
+
+## Project Structure
+```
+liqo-resource-broker/
+├── api/v1alpha1/                    # CRD definitions
+│   ├── clusteradvertisement_types.go
+│   └── reservation_types.go
+├── cmd/main.go                       # Entry point
+├── internal/
+│   ├── controller/                   # Controllers
+│   │   ├── clusteradvertisement_controller.go
+│   │   └── reservation_controller.go
+│   ├── broker/                       # Decision engine
+│   │   └── decision_engine.go
+│   └── resource/                     # Resource math
+│       └── calculator.go
+└── config/                           # Kubernetes manifests
+```
+
+---
 
 ## Development
 
@@ -141,60 +206,91 @@ Higher score = more available resources = better choice
 make build
 ```
 
+### Generate CRDs
+```bash
+make manifests
+```
+
 ### Run Tests
 ```bash
 make test
 ```
 
-### Generate Manifests
-```bash
-make manifests
+---
+
+## Resource Locking
+
+The broker implements optimistic concurrency control:
+
+1. **Reservation Created** → Broker selects best cluster
+2. **Resources Locked** → `Reserved` field updated in ClusterAdvertisement
+3. **Available Recalculated** → `Available = Allocatable - Allocated - Reserved`
+4. **Expiration/Deletion** → Resources automatically released
+
+### Example Flow
+```
+Initial State:
+- Available: 8950m CPU
+
+Reservation 1 (3 CPU):
+- Locked: 3000m
+- Available: 5950m ✅
+
+Reservation 2 (5 CPU):
+- Request: 5000m
+- Available: 5950m
+- Locked: 5000m
+- Available: 950m ✅
+
+Reservation 3 (2 CPU):
+- Request: 2000m
+- Available: 950m
+- Status: FAILED ❌ (insufficient resources)
 ```
 
-### Update Cluster Timestamp (for testing)
-```bash
-kubectl patch clusteradvertisement cluster-1-adv --type='json' \
-  -p="[{'op': 'replace', 'path': '/spec/timestamp', 'value': '$(date -u +"%Y-%m-%dT%H:%M:%SZ")'}]"
-```
+---
 
-## Project Structure
-```
-.
-├── api/v1alpha1/              # CRD definitions
-│   ├── clusteradvertisement_types.go
-│   └── reservation_types.go
-├── internal/
-│   ├── broker/                # Decision engine
-│   │   └── decision.go
-│   └── controller/            # Controllers
-│       ├── clusteradvertisement_controller.go
-│       └── reservation_controller.go
-├── config/                    # Kubernetes manifests
-│   ├── crd/                   # Generated CRDs
-│   ├── samples/               # Example resources
-│   └── rbac/                  # RBAC rules
-└── cmd/                       # Main entrypoint
-```
+## Configuration
+
+### Command-Line Flags
+
+- `--health-probe-bind-address`: Health probe address (default: `:8081`)
+- `--metrics-bind-address`: Metrics endpoint (default: `:8080`)
+- `--leader-elect`: Enable leader election (default: `false`)
+
+### Advertisement Staleness
+
+Advertisements older than **10 minutes** are marked as **Inactive**.
+
+---
+
+## Testing Results
+
+✅ Resource locking prevents overbooking  
+✅ Handles exact resource fits (0 remaining)  
+✅ Fails correctly when insufficient resources  
+✅ Auto-releases on expiration  
+✅ Proper cleanup on manual deletion  
+✅ Concurrent reservations handled safely
+
+---
 
 ## Documentation
 
-- [Phase 2 Report](PHASE2_REPORT.md) - Detailed technical explanation
-- [API Reference](api/v1alpha1/) - CRD schemas
+- Phase reports and implementation details available in repository
 
-## Current Limitations
+---
 
-- Cluster advertisements must be manually created (Phase 3 will add RA→RB communication)
-- No actual resource locking in target clusters (Phase 4)
-- Simple scoring algorithm (can be enhanced)
-- No authentication between components (Phase 3)
+## Related Repository
+
+- [liqo-resource-agent](https://github.com/mehdiazizian/liqo-resource-agent) - Cluster resource agent
+
+---
 
 ## License
 
-Apache 2.0
+Apache License 2.0
 
-## Project Info
+## Author
 
-- **Domain**: fluidos.eu
-- **API Group**: broker.fluidos.eu
-- **Version**: v1alpha1
-- **REAR Protocol**: Compliant
+Mehdi Azizian - Master's Thesis Project (2025)
