@@ -126,6 +126,7 @@ func (r *ReservationReconciler) handlePendingReservation(
 	// Otherwise, select best cluster based on decision engine
 	bestCluster, err := r.DecisionEngine.SelectBestCluster(
 		ctx,
+		reservation.Spec.RequesterID,
 		reservation.Spec.RequestedResources.CPU,
 		reservation.Spec.RequestedResources.Memory,
 	)
