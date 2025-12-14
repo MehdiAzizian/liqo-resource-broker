@@ -18,6 +18,7 @@ type DecisionEngine struct {
 // SelectBestCluster finds the most suitable cluster based on requested resources
 func (d *DecisionEngine) SelectBestCluster(
 	ctx context.Context,
+	requesterID string,
 	requestedCPU, requestedMemory resource.Quantity,
 ) (*brokerv1alpha1.ClusterAdvertisement, error) {
 
@@ -36,6 +37,11 @@ func (d *DecisionEngine) SelectBestCluster(
 
 	for i := range advList.Items {
 		cluster := &advList.Items[i]
+
+		// Skip if it's the requester's own cluster
+		if cluster.Spec.ClusterID == requesterID {
+			continue
+		}
 
 		// Skip inactive clusters
 		if !cluster.Status.Active {
