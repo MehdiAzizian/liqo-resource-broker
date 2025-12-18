@@ -92,6 +92,13 @@ type ReservationStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
+const (
+	// ReservationConditionRequesterActive indicates the requester signaled readiness.
+	ReservationConditionRequesterActive = "RequesterActive"
+	// ReservationConditionRequesterReleased indicates the requester finished consuming resources.
+	ReservationConditionRequesterReleased = "RequesterReleased"
+)
+
 // ReservationPhase represents the phase of a reservation
 type ReservationPhase string
 

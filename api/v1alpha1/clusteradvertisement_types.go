@@ -114,7 +114,20 @@ type ClusterAdvertisementStatus struct {
 	// Score is calculated based on availability and cost (higher is better)
 	// +optional
 	Score string `json:"score,omitempty"`
+
+	// Conditions represent the latest observations of the cluster advertisement state
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
+
+const (
+	// ClusterAdvertisementConditionReady indicates the cluster is ready to accept reservations
+	ClusterAdvertisementConditionReady = "Ready"
+	// ClusterAdvertisementConditionStale indicates the advertisement is stale
+	ClusterAdvertisementConditionStale = "Stale"
+	// ClusterAdvertisementConditionOvercommitted indicates reserved > available
+	ClusterAdvertisementConditionOvercommitted = "Overcommitted"
+)
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status

@@ -32,6 +32,7 @@ The Resource Broker receives resource advertisements from multiple Kubernetes cl
 - States: Pending → Reserved → Active → Released/Failed
 - Configurable duration with auto-expiration
 - Manual deletion with proper cleanup
+- Feedback hooks: requester clusters set the `RequesterActive` / `RequesterReleased` status conditions to promote or release reservations in seconds.
 
 ---
 
@@ -157,6 +158,12 @@ status:
   targetClusterID: "fd32c7d2-7cc6-46e6-80aa-d3d5c835586c"
   reservedAt: "2025-11-22T15:00:00Z"
   expiresAt: "2025-11-22T16:00:00Z"
+  conditions:
+    - type: RequesterActive
+      status: "True"
+      reason: "PeeringReady"
+      message: "Requester established Liqo peering"
+      lastTransitionTime: "2025-11-22T15:05:00Z"
 ```
 
 ---
@@ -246,6 +253,25 @@ Reservation 3 (2 CPU):
 - Request: 2000m
 - Available: 950m
 - Status: FAILED ❌ (insufficient resources)
+
+### Feedback from Clusters
+
+After the broker locks resources, the requesting cluster confirms activation by patching the reservation status:
+
+```bash
+kubectl patch reservation my-workload --type=merge --subresource=status -p '{
+  "status": {
+    "conditions": [{
+      "type": "RequesterActive",
+      "status": "True",
+      "reason": "PeeringReady",
+      "message": "Liqo peering established"
+    }]
+  }
+}'
+```
+
+When the workload is complete (or if you want to release early), patch the `RequesterReleased` condition. The broker sees these conditions, transitions the reservation to `Active` or `Released`, and updates cluster advertisements immediately so other clusters can reuse the capacity.
 ```
 
 ---

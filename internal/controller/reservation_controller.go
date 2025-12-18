@@ -18,11 +18,16 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/go-logr/logr"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -31,7 +36,6 @@ import (
 	brokerv1alpha1 "github.com/mehdiazizian/liqo-resource-broker/api/v1alpha1"
 	"github.com/mehdiazizian/liqo-resource-broker/internal/broker"
 	"github.com/mehdiazizian/liqo-resource-broker/internal/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // ReservationReconciler reconciles a Reservation object
@@ -40,6 +44,11 @@ type ReservationReconciler struct {
 	Scheme         *runtime.Scheme
 	DecisionEngine *broker.DecisionEngine
 }
+
+var (
+	errTargetClusterNotFound = errors.New("target cluster not found")
+	errInsufficientResources = errors.New("insufficient resources")
+)
 
 // +kubebuilder:rbac:groups=broker.fluidos.eu,resources=reservations,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=broker.fluidos.eu,resources=reservations/status,verbs=get;update;patch
@@ -89,6 +98,20 @@ func (r *ReservationReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 	}
 
+	if err := validateReservationSpec(reservation); err != nil {
+		logger.Error(err, "invalid reservation spec",
+			"reservation", reservation.Name,
+			"requesterID", reservation.Spec.RequesterID)
+		reservation.Status.Phase = brokerv1alpha1.ReservationPhaseFailed
+		reservation.Status.Message = fmt.Sprintf("Invalid reservation specification: %v. "+
+			"Please check that requesterID is set and requested resources are positive values.", err)
+		reservation.Status.LastUpdateTime = metav1.Now()
+		if err := r.Status().Update(ctx, reservation); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
 	// Handle different phases
 	switch reservation.Status.Phase {
 	case "": // New reservation
@@ -129,12 +152,19 @@ func (r *ReservationReconciler) handlePendingReservation(
 		reservation.Spec.RequesterID,
 		reservation.Spec.RequestedResources.CPU,
 		reservation.Spec.RequestedResources.Memory,
+		reservation.Spec.Priority,
 	)
 
 	if err != nil {
-		logger.Error(err, "Failed to select cluster")
+		logger.Error(err, "failed to select cluster",
+			"requesterID", reservation.Spec.RequesterID,
+			"requestedCPU", reservation.Spec.RequestedResources.CPU.String(),
+			"requestedMemory", reservation.Spec.RequestedResources.Memory.String())
 		reservation.Status.Phase = brokerv1alpha1.ReservationPhaseFailed
-		reservation.Status.Message = fmt.Sprintf("Failed to find suitable cluster: %v", err)
+		reservation.Status.Message = fmt.Sprintf("No suitable cluster found. Requested: %s CPU, %s Memory. "+
+			"Ensure clusters are registered, active, and have sufficient available resources.",
+			reservation.Spec.RequestedResources.CPU.String(),
+			reservation.Spec.RequestedResources.Memory.String())
 		reservation.Status.LastUpdateTime = metav1.Now()
 
 		if err := r.Status().Update(ctx, reservation); err != nil {
@@ -160,86 +190,64 @@ func (r *ReservationReconciler) reserveInTargetCluster(
 	logger logr.Logger,
 ) (ctrl.Result, error) {
 
-	// Find target cluster
-	clusterAdv := &brokerv1alpha1.ClusterAdvertisement{}
-	clusterList := &brokerv1alpha1.ClusterAdvertisementList{}
+	var lockedCluster *brokerv1alpha1.ClusterAdvertisement
 
-	if err := r.List(ctx, clusterList); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	found := false
-	for i := range clusterList.Items {
-		if clusterList.Items[i].Spec.ClusterID == reservation.Spec.TargetClusterID {
-			clusterAdv = &clusterList.Items[i]
-			found = true
-			break
+	lockErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		clusterAdv, err := r.findClusterByID(ctx, reservation.Spec.TargetClusterID)
+		if err != nil {
+			return err
 		}
-	}
 
-	if !found {
-		reservation.Status.Phase = brokerv1alpha1.ReservationPhaseFailed
-		reservation.Status.Message = "Target cluster not found"
-		reservation.Status.LastUpdateTime = metav1.Now()
-
-		if err := r.Status().Update(ctx, reservation); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
-	}
-
-	// Check if cluster has enough available resources (using resource calculator)
-	if !resource.CanReserve(
-		clusterAdv,
-		reservation.Spec.RequestedResources.CPU,
-		reservation.Spec.RequestedResources.Memory,
-	) {
-		reservation.Status.Phase = brokerv1alpha1.ReservationPhaseFailed
-		reservation.Status.Message = "Insufficient resources in target cluster"
-		reservation.Status.LastUpdateTime = metav1.Now()
-
-		if err := r.Status().Update(ctx, reservation); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
-	}
-
-	// LOCK RESOURCES: Add to reserved
-	err := resource.AddReservation(
-		clusterAdv,
-		reservation.Spec.RequestedResources.CPU,
-		reservation.Spec.RequestedResources.Memory,
-	)
-	if err != nil {
-		logger.Error(err, "Failed to add reservation to cluster")
-		reservation.Status.Phase = brokerv1alpha1.ReservationPhaseFailed
-		reservation.Status.Message = fmt.Sprintf("Failed to lock resources: %v", err)
-		reservation.Status.LastUpdateTime = metav1.Now()
-
-		if err := r.Status().Update(ctx, reservation); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
-	}
-
-	// Update the cluster advertisement with new reserved resources
-	if err := r.Update(ctx, clusterAdv); err != nil {
-		logger.Error(err, "Failed to update cluster advertisement")
-		// Try to rollback the reservation
-		_ = resource.RemoveReservation(
+		if !resource.CanReserve(
 			clusterAdv,
 			reservation.Spec.RequestedResources.CPU,
 			reservation.Spec.RequestedResources.Memory,
-		)
+		) {
+			return errInsufficientResources
+		}
 
+		if err := resource.AddReservation(
+			clusterAdv,
+			reservation.Spec.RequestedResources.CPU,
+			reservation.Spec.RequestedResources.Memory,
+		); err != nil {
+			return err
+		}
+
+		lockedCluster = clusterAdv
+		return r.Update(ctx, clusterAdv)
+	})
+
+	switch {
+	case errors.Is(lockErr, errTargetClusterNotFound):
 		reservation.Status.Phase = brokerv1alpha1.ReservationPhaseFailed
-		reservation.Status.Message = "Failed to lock resources in cluster"
+		reservation.Status.Message = fmt.Sprintf("Target cluster '%s' not found. "+
+			"The cluster may have been removed or is not registered with the broker.",
+			reservation.Spec.TargetClusterID)
 		reservation.Status.LastUpdateTime = metav1.Now()
-
 		if err := r.Status().Update(ctx, reservation); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
+	case errors.Is(lockErr, errInsufficientResources):
+		reservation.Status.Phase = brokerv1alpha1.ReservationPhaseFailed
+		reservation.Status.Message = fmt.Sprintf("Insufficient resources in cluster '%s'. "+
+			"Requested: %s CPU, %s Memory. "+
+			"The cluster may have insufficient available capacity or resources may have been allocated to other reservations.",
+			reservation.Spec.TargetClusterID,
+			reservation.Spec.RequestedResources.CPU.String(),
+			reservation.Spec.RequestedResources.Memory.String())
+		reservation.Status.LastUpdateTime = metav1.Now()
+		if err := r.Status().Update(ctx, reservation); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	case lockErr != nil:
+		logger.Error(lockErr, "failed to lock resources in cluster",
+			"targetClusterID", reservation.Spec.TargetClusterID,
+			"requestedCPU", reservation.Spec.RequestedResources.CPU.String(),
+			"requestedMemory", reservation.Spec.RequestedResources.Memory.String())
+		return ctrl.Result{}, lockErr
 	}
 
 	// Mark as reserved
@@ -264,7 +272,7 @@ func (r *ReservationReconciler) reserveInTargetCluster(
 		"targetCluster", reservation.Spec.TargetClusterID,
 		"cpu", reservation.Spec.RequestedResources.CPU.String(),
 		"memory", reservation.Spec.RequestedResources.Memory.String(),
-		"availableAfter", clusterAdv.Spec.Resources.Available.CPU.String())
+		"availableAfter", lockedCluster.Spec.Resources.Available.CPU.String())
 
 	return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
 }
@@ -275,6 +283,17 @@ func (r *ReservationReconciler) handleReservedReservation(
 	reservation *brokerv1alpha1.Reservation,
 	logger logr.Logger,
 ) (ctrl.Result, error) {
+
+	if reservationHasCondition(reservation, brokerv1alpha1.ReservationConditionRequesterActive) {
+		logger.Info("Requester confirmed activation, promoting reservation to Active")
+		reservation.Status.Phase = brokerv1alpha1.ReservationPhaseActive
+		reservation.Status.Message = "Requester confirmed activation"
+		reservation.Status.LastUpdateTime = metav1.Now()
+		if err := r.Status().Update(ctx, reservation); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
+	}
 
 	// Check if expired
 	if reservation.Status.ExpiresAt != nil && time.Now().After(reservation.Status.ExpiresAt.Time) {
@@ -306,6 +325,20 @@ func (r *ReservationReconciler) handleActiveReservation(
 	reservation *brokerv1alpha1.Reservation,
 	logger logr.Logger,
 ) (ctrl.Result, error) {
+
+	if reservationHasCondition(reservation, brokerv1alpha1.ReservationConditionRequesterReleased) {
+		logger.Info("Requester signaled release, freeing resources")
+		if err := r.releaseResources(ctx, reservation, logger); err != nil {
+			return ctrl.Result{}, err
+		}
+		reservation.Status.Phase = brokerv1alpha1.ReservationPhaseReleased
+		reservation.Status.Message = "Requester released reservation"
+		reservation.Status.LastUpdateTime = metav1.Now()
+		if err := r.Status().Update(ctx, reservation); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
 
 	// Check if expired
 	if reservation.Status.ExpiresAt != nil && time.Now().After(reservation.Status.ExpiresAt.Time) {
@@ -381,6 +414,57 @@ func (r *ReservationReconciler) releaseResources(
 		"cpu", reservation.Spec.RequestedResources.CPU.String(),
 		"memory", reservation.Spec.RequestedResources.Memory.String())
 
+	return nil
+}
+
+func (r *ReservationReconciler) findClusterByID(
+	ctx context.Context,
+	clusterID string,
+) (*brokerv1alpha1.ClusterAdvertisement, error) {
+	clusterList := &brokerv1alpha1.ClusterAdvertisementList{}
+	if err := r.List(ctx, clusterList); err != nil {
+		return nil, err
+	}
+
+	for i := range clusterList.Items {
+		item := clusterList.Items[i]
+		if item.Spec.ClusterID != clusterID {
+			continue
+		}
+
+		cluster := &brokerv1alpha1.ClusterAdvertisement{}
+		if err := r.Get(ctx, types.NamespacedName{Name: item.Name, Namespace: item.Namespace}, cluster); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, fmt.Errorf("%w: %s", errTargetClusterNotFound, clusterID)
+			}
+			return nil, err
+		}
+
+		return cluster, nil
+	}
+
+	return nil, fmt.Errorf("%w: %s", errTargetClusterNotFound, clusterID)
+}
+
+func reservationHasCondition(reservation *brokerv1alpha1.Reservation, conditionType string) bool {
+	for _, cond := range reservation.Status.Conditions {
+		if cond.Type == conditionType && cond.Status == metav1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func validateReservationSpec(reservation *brokerv1alpha1.Reservation) error {
+	if reservation.Spec.RequesterID == "" {
+		return errors.New("spec.requesterID must be set")
+	}
+	if reservation.Spec.RequestedResources.CPU.Sign() <= 0 {
+		return errors.New("requested CPU must be greater than zero")
+	}
+	if reservation.Spec.RequestedResources.Memory.Sign() <= 0 {
+		return errors.New("requested memory must be greater than zero")
+	}
 	return nil
 }
 

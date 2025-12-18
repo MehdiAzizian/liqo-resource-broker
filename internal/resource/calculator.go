@@ -45,16 +45,8 @@ func AddReservation(
 	clusterAdv.Spec.Resources.Reserved.CPU.Add(cpuToReserve)
 	clusterAdv.Spec.Resources.Reserved.Memory.Add(memoryToReserve)
 
-	// Recalculate available: Allocatable - Allocated - Reserved
-	available := clusterAdv.Spec.Resources.Allocatable.CPU.DeepCopy()
-	available.Sub(clusterAdv.Spec.Resources.Allocated.CPU)
-	available.Sub(clusterAdv.Spec.Resources.Reserved.CPU)
-	clusterAdv.Spec.Resources.Available.CPU = available
-
-	availableMem := clusterAdv.Spec.Resources.Allocatable.Memory.DeepCopy()
-	availableMem.Sub(clusterAdv.Spec.Resources.Allocated.Memory)
-	availableMem.Sub(clusterAdv.Spec.Resources.Reserved.Memory)
-	clusterAdv.Spec.Resources.Available.Memory = availableMem
+	// Recalculate available using single source of truth
+	UpdateAvailableResources(&clusterAdv.Spec.Resources)
 
 	return nil
 }
@@ -72,16 +64,8 @@ func RemoveReservation(
 	clusterAdv.Spec.Resources.Reserved.CPU.Sub(cpuToRelease)
 	clusterAdv.Spec.Resources.Reserved.Memory.Sub(memoryToRelease)
 
-	// Recalculate available: Allocatable - Allocated - Reserved
-	available := clusterAdv.Spec.Resources.Allocatable.CPU.DeepCopy()
-	available.Sub(clusterAdv.Spec.Resources.Allocated.CPU)
-	available.Sub(clusterAdv.Spec.Resources.Reserved.CPU)
-	clusterAdv.Spec.Resources.Available.CPU = available
-
-	availableMem := clusterAdv.Spec.Resources.Allocatable.Memory.DeepCopy()
-	availableMem.Sub(clusterAdv.Spec.Resources.Allocated.Memory)
-	availableMem.Sub(clusterAdv.Spec.Resources.Reserved.Memory)
-	clusterAdv.Spec.Resources.Available.Memory = availableMem
+	// Recalculate available using single source of truth
+	UpdateAvailableResources(&clusterAdv.Spec.Resources)
 
 	return nil
 }

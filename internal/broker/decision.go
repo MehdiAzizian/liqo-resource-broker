@@ -20,6 +20,7 @@ func (d *DecisionEngine) SelectBestCluster(
 	ctx context.Context,
 	requesterID string,
 	requestedCPU, requestedMemory resource.Quantity,
+	priority int32,
 ) (*brokerv1alpha1.ClusterAdvertisement, error) {
 
 	// List all cluster advertisements
@@ -54,7 +55,7 @@ func (d *DecisionEngine) SelectBestCluster(
 		}
 
 		// Calculate score
-		score := d.calculateScore(cluster, requestedCPU, requestedMemory)
+		score := d.calculateScore(cluster, requestedCPU, requestedMemory, priority)
 
 		if score > bestScore {
 			bestScore = score
@@ -85,6 +86,7 @@ func (d *DecisionEngine) hasEnoughResources(
 func (d *DecisionEngine) calculateScore(
 	cluster *brokerv1alpha1.ClusterAdvertisement,
 	requestedCPU, requestedMemory resource.Quantity,
+	priority int32,
 ) float64 {
 	// Calculate CPU utilization after reservation (0-1)
 	allocatableCPU := cluster.Spec.Resources.Allocatable.CPU.AsApproximateFloat64()
@@ -111,7 +113,9 @@ func (d *DecisionEngine) calculateScore(
 		score = score * 0.9 // Slight penalty if cost exists but not optimized
 	}
 
-	return score
+	priorityBonus := float64(priority) * 0.01
+
+	return score + priorityBonus
 }
 
 // UpdateClusterScore updates the score field in the cluster advertisement status

@@ -20,6 +20,7 @@ import (
 	"context"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -27,14 +28,16 @@ import (
 
 	brokerv1alpha1 "github.com/mehdiazizian/liqo-resource-broker/api/v1alpha1"
 	"github.com/mehdiazizian/liqo-resource-broker/internal/broker"
+	"github.com/mehdiazizian/liqo-resource-broker/internal/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // ClusterAdvertisementReconciler reconciles a ClusterAdvertisement object
 type ClusterAdvertisementReconciler struct {
 	client.Client
-	Scheme         *runtime.Scheme
-	DecisionEngine *broker.DecisionEngine
+	Scheme             *runtime.Scheme
+	DecisionEngine     *broker.DecisionEngine
+	StalenessThreshold time.Duration // Configurable staleness threshold
 }
 
 // +kubebuilder:rbac:groups=broker.fluidos.eu,resources=clusteradvertisements,verbs=get;list;watch;create;update;patch;delete
@@ -58,20 +61,8 @@ func (r *ClusterAdvertisementReconciler) Reconcile(ctx context.Context, req ctrl
 		return ctrl.Result{}, err
 	}
 
-	// Recalculate Available based on Allocatable - Allocated - Reserved
-	available := clusterAdv.Spec.Resources.Allocatable.CPU.DeepCopy()
-	available.Sub(clusterAdv.Spec.Resources.Allocated.CPU)
-	if clusterAdv.Spec.Resources.Reserved != nil {
-		available.Sub(clusterAdv.Spec.Resources.Reserved.CPU)
-	}
-	clusterAdv.Spec.Resources.Available.CPU = available
-
-	availableMem := clusterAdv.Spec.Resources.Allocatable.Memory.DeepCopy()
-	availableMem.Sub(clusterAdv.Spec.Resources.Allocated.Memory)
-	if clusterAdv.Spec.Resources.Reserved != nil {
-		availableMem.Sub(clusterAdv.Spec.Resources.Reserved.Memory)
-	}
-	clusterAdv.Spec.Resources.Available.Memory = availableMem
+	// Recalculate Available using single source of truth
+	resource.UpdateAvailableResources(&clusterAdv.Spec.Resources)
 
 	// Update the spec with recalculated available
 	if err := r.Update(ctx, clusterAdv); err != nil {
@@ -79,9 +70,13 @@ func (r *ClusterAdvertisementReconciler) Reconcile(ctx context.Context, req ctrl
 		// Continue anyway to update status
 	}
 
-	// Check if advertisement is stale (older than 2 minutes)
+	// Check if advertisement is stale
 	age := time.Since(clusterAdv.Spec.Timestamp.Time)
-	isStale := age > 10*time.Minute
+	stalenessThreshold := r.StalenessThreshold
+	if stalenessThreshold == 0 {
+		stalenessThreshold = 2 * time.Minute // Default: 2 minutes (reduced from 10)
+	}
+	isStale := age > stalenessThreshold
 
 	// Update status
 	clusterAdv.Status.Active = !isStale
@@ -97,6 +92,9 @@ func (r *ClusterAdvertisementReconciler) Reconcile(ctx context.Context, req ctrl
 	if err := r.DecisionEngine.UpdateClusterScore(ctx, clusterAdv); err != nil {
 		logger.Error(err, "Failed to update cluster score")
 	}
+
+	// Update conditions
+	r.updateConditions(clusterAdv, isStale)
 
 	clusterAdv.Status.LastUpdateTime = metav1.Now()
 
@@ -114,6 +112,64 @@ func (r *ClusterAdvertisementReconciler) Reconcile(ctx context.Context, req ctrl
 
 	// Requeue after 30 seconds to check for staleness
 	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+}
+
+// updateConditions updates the status conditions for the cluster advertisement
+func (r *ClusterAdvertisementReconciler) updateConditions(clusterAdv *brokerv1alpha1.ClusterAdvertisement, isStale bool) {
+	now := metav1.Now()
+
+	// Ready condition
+	readyStatus := metav1.ConditionTrue
+	readyReason := "ClusterActive"
+	readyMessage := "Cluster is active and ready to accept reservations"
+	if isStale {
+		readyStatus = metav1.ConditionFalse
+		readyReason = "ClusterStale"
+		readyMessage = "Cluster advertisement is stale and not accepting new reservations"
+	}
+	meta.SetStatusCondition(&clusterAdv.Status.Conditions, metav1.Condition{
+		Type:               brokerv1alpha1.ClusterAdvertisementConditionReady,
+		Status:             readyStatus,
+		Reason:             readyReason,
+		Message:            readyMessage,
+		LastTransitionTime: now,
+	})
+
+	// Stale condition
+	staleStatus := metav1.ConditionFalse
+	if isStale {
+		staleStatus = metav1.ConditionTrue
+	}
+	meta.SetStatusCondition(&clusterAdv.Status.Conditions, metav1.Condition{
+		Type:               brokerv1alpha1.ClusterAdvertisementConditionStale,
+		Status:             staleStatus,
+		Reason:             "AdvertisementAge",
+		Message:            "Advertisement freshness check",
+		LastTransitionTime: now,
+	})
+
+	// Overcommitted condition - check if reserved > available
+	isOvercommitted := false
+	if clusterAdv.Spec.Resources.Reserved != nil {
+		if clusterAdv.Spec.Resources.Reserved.CPU.Cmp(clusterAdv.Spec.Resources.Available.CPU) > 0 ||
+			clusterAdv.Spec.Resources.Reserved.Memory.Cmp(clusterAdv.Spec.Resources.Available.Memory) > 0 {
+			isOvercommitted = true
+		}
+	}
+
+	overcommittedStatus := metav1.ConditionFalse
+	overcommittedMessage := "Resources are within acceptable limits"
+	if isOvercommitted {
+		overcommittedStatus = metav1.ConditionTrue
+		overcommittedMessage = "Reserved resources exceed available capacity"
+	}
+	meta.SetStatusCondition(&clusterAdv.Status.Conditions, metav1.Condition{
+		Type:               brokerv1alpha1.ClusterAdvertisementConditionOvercommitted,
+		Status:             overcommittedStatus,
+		Reason:             "ResourceCheck",
+		Message:            overcommittedMessage,
+		LastTransitionTime: now,
+	})
 }
 
 // SetupWithManager sets up the controller with the Manager.
