@@ -268,11 +268,17 @@ func (r *ReservationReconciler) reserveInTargetCluster(
 		return ctrl.Result{}, err
 	}
 
-	logger.Info("Resources successfully locked",
-		"targetCluster", reservation.Spec.TargetClusterID,
-		"cpu", reservation.Spec.RequestedResources.CPU.String(),
-		"memory", reservation.Spec.RequestedResources.Memory.String(),
-		"availableAfter", lockedCluster.Spec.Resources.Available.CPU.String())
+	logger.Info(fmt.Sprintf("✅ Resources Locked Successfully\n"+
+		"  └─ Reservation: %s\n"+
+		"  └─ Target Cluster: %s\n"+
+		"  └─ Locked: cpu=%s, memory=%s\n"+
+		"  └─ Remaining Available: cpu=%s, memory=%s",
+		reservation.Name,
+		reservation.Spec.TargetClusterID,
+		reservation.Spec.RequestedResources.CPU.String(),
+		reservation.Spec.RequestedResources.Memory.String(),
+		lockedCluster.Spec.Resources.Available.CPU.String(),
+		lockedCluster.Spec.Resources.Available.Memory.String()))
 
 	return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
 }
